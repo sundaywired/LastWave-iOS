@@ -308,6 +308,11 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
   Timer? _crossfadeTimer;
   double _crossfadeTargetVolume = 1.0;
   String _crossfadeResolvedKey = '';
+  // Short release trace after a deck handoff; helps distinguish a native
+  // playback stall from stale events emitted by the retired player.
+  String _handoffWatchKey = '';
+  DateTime? _handoffWatchUntil;
+  int _handoffLastLoggedSecond = -1;
   DateTime _lastCrossfadeResolveAttempt =
       DateTime.fromMillisecondsSinceEpoch(0);
 
@@ -651,6 +656,11 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
     _subs.addAll([
       p.stream.playing.listen((v) {
         runGuarded('player.playing', () {
+          if (!identical(_player, p)) return;
+          if (_handoffWatchKey == state.current?.queueKey) {
+            _crumb('automix handoff playing key=$_handoffWatchKey '
+                'value=$v player=${identityHashCode(p)}');
+          }
           state = state.copyWith(isPlaying: v);
           _onPlayingChanged(v);
           unawaited(_syncIosNowPlaying(force: true));
@@ -658,12 +668,14 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.buffering.listen((v) {
         runGuarded('player.buffering', () {
+          if (!identical(_player, p)) return;
           if (state.error != null) return;
           state = state.copyWith(isBuffering: _resolving || v);
         });
       }),
       p.stream.position.listen((v) {
         runGuarded('player.position', () {
+          if (!identical(_player, p)) return;
           _maybeLogFirstAudio(v);
           // A restored session has a current track and saved position but no
           // live stream until the user resumes it. mpv emits its idle clock
@@ -680,6 +692,21 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
             return;
           }
           _lastPositionEmit = now;
+          final watchUntil = _handoffWatchUntil;
+          if (_handoffWatchKey == state.current?.queueKey &&
+              watchUntil != null &&
+              now.isBefore(watchUntil) &&
+              v.inSeconds != _handoffLastLoggedSecond) {
+            _handoffLastLoggedSecond = v.inSeconds;
+            _crumb('automix handoff watch key=$_handoffWatchKey '
+                'position=${v.inSeconds}s playing=${p.state.playing} '
+                'buffering=${p.state.buffering} '
+                'volume=${p.state.volume.toStringAsFixed(1)}');
+          } else if (watchUntil != null && !now.isBefore(watchUntil)) {
+            _handoffWatchKey = '';
+            _handoffWatchUntil = null;
+            _handoffLastLoggedSecond = -1;
+          }
           // Gated to 10Hz: identical scrobble accuracy (wall-clock delta),
           // prefetch is once-per-track. Saves 60Hz DateTime+prefs wakes.
           _tickScrobble(v);
@@ -694,6 +721,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.buffer.listen((v) {
         runGuarded('player.buffer', () {
+          if (!identical(_player, p)) return;
           if (_resolving || state.error != null) return;
           if (state.buffered == v) return;
           final now = DateTime.now();
@@ -711,6 +739,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.duration.listen((v) {
         runGuarded('player.duration', () {
+          if (!identical(_player, p)) return;
           if (_resolving || state.error != null) return;
           state = state.copyWith(duration: v);
           unawaited(_syncIosNowPlaying(force: true));
@@ -725,6 +754,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.volume.listen((v) {
         runGuarded('player.volume', () {
+          if (!identical(_player, p)) return;
           // Deliberately NOT copied into state.volume. Every volume change
           // the listener makes goes through setVolume(), so state.volume is
           // the single source of truth; mpv's value also moves with mix
@@ -735,6 +765,11 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.completed.listen((done) {
         runGuarded('player.completed', () {
+          if (!identical(_player, p)) return;
+          if (_handoffWatchKey == state.current?.queueKey && done) {
+            _crumb('automix handoff active deck completed '
+                'key=$_handoffWatchKey player=${identityHashCode(p)}');
+          }
           // A deck can emit its final completion event while it is being
           // retired after a crossfade. Only the currently active deck may
           // complete the queue's current track.
@@ -744,6 +779,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.log.listen((PlayerLog l) {
         runGuarded('player.log', () {
+          if (!identical(_player, p)) return;
           if (kDebugMode) {
             _mpvLogTail.add(l);
             if (_mpvLogTail.length > _mpvLogTailMax) {
@@ -755,6 +791,11 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.error.listen((e) {
         runGuarded('player.error-event', () {
+          if (!identical(_player, p)) return;
+          if (_handoffWatchKey == state.current?.queueKey) {
+            _crumb('automix handoff active deck error '
+                'key=$_handoffWatchKey error=${e.length > 120 ? e.substring(0, 120) : e}');
+          }
           // A rejected audio filter is not a broken stream: the audio
           // keeps playing. Treating it as one restarted the song, then
           // fell back to YouTube, then marked it unavailable and skipped.
@@ -772,6 +813,7 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       }),
       p.stream.audioParams.listen((_) {
         runGuarded('player.audio-params', () {
+          if (!identical(_player, p)) return;
           unawaited(runGuardedAsync(
               'player.ao-format', () => _refreshAoFormat()));
         });
@@ -1636,7 +1678,12 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
         _prefs.autoMixSpectral &&
         _sweepSupported != false;
     _crumb('automix start key=${_standbyTrack?.queueKey} '
-        'overlap=${fadeDuration.inSeconds}s sweep=$spectral');
+        'overlap=${fadeDuration.inSeconds}s sweep=$spectral '
+        'out_player=${identityHashCode(_player)} '
+        'out_pos=${_player?.state.position.inSeconds ?? -1}s '
+        'in_player=${identityHashCode(_standbyPlayer)} '
+        'in_pos=${_standbyPlayer?.state.position.inSeconds ?? -1}s '
+        'in_playing=${_standbyPlayer?.state.playing}');
 
     try {
       unawaited(_standbyPlayer!.play());
@@ -1744,6 +1791,12 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
     _flushScrobble(completed: true);
 
     final oldPrimary = _player;
+    _crumb('automix handoff begin key=${incomingTrack.queueKey} '
+        'incoming_player=${identityHashCode(sb)} '
+        'incoming_pos=${sb.state.position.inSeconds}s '
+        'incoming_playing=${sb.state.playing} '
+        'incoming_volume=${sb.state.volume.toStringAsFixed(1)} '
+        'outgoing_player=${identityHashCode(oldPrimary)}');
 
     final beatPlan = _armedBeatPlan;
     _armedBeatPlan = null;
@@ -1772,8 +1825,22 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
     _standbyPlayer = oldPrimary;
     _rebindPlayerStreams();
     try {
-      unawaited(oldPrimary?.stop());
-      oldPrimary?.setVolume(0);
+      if (oldPrimary != null) {
+        final retired = oldPrimary;
+        _crumb('automix retired stop requested '
+            'player=${identityHashCode(retired)}');
+        unawaited(() async {
+          try {
+            await retired.stop();
+            _crumb('automix retired stop completed '
+                'player=${identityHashCode(retired)}');
+          } catch (e) {
+            _crumb('automix retired stop failed '
+                'player=${identityHashCode(retired)} error=${e.runtimeType}');
+          }
+        }());
+        retired.setVolume(0);
+      }
     } catch (_) {}
     // The deck that just faded out still carries the low-pass sweep; clear
     // it so the next mix does not start from a darkened signal.
@@ -1810,6 +1877,13 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
       duration: trackDur,
       clearError: true,
     );
+    _handoffWatchKey = incomingTrack.queueKey;
+    _handoffWatchUntil = DateTime.now().add(const Duration(seconds: 18));
+    _handoffLastLoggedSecond = -1;
+    _crumb('automix handoff promoted key=${incomingTrack.queueKey} '
+        'player=${identityHashCode(sb)} '
+        'position=${livePos.inSeconds}s playing=${sb.state.playing} '
+        'volume=${sb.state.volume.toStringAsFixed(1)}');
 
     _beginScrobbleWindow(incomingTrack);
 
