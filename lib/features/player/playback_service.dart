@@ -773,7 +773,6 @@ class PlaybackService extends StateNotifier<PlayerSnapshot> {
           // A deck can emit its final completion event while it is being
           // retired after a crossfade. Only the currently active deck may
           // complete the queue's current track.
-          if (!identical(_player, p)) return;
           if (done) _onTrackCompleted();
         });
       }),
